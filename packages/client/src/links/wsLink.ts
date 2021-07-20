@@ -22,12 +22,20 @@ export interface WebSocketClientOptions {
   url: string;
   WebSocket?: WebSocket;
   retryDelayMs?: typeof retryDelay;
+  /**
+   * Connection mode - lazy or eager.
+   * - lazy: the connection is established when the first message is sent and disconnects when there are no pending messages.
+   * - eager: the connection is established immediately and never disconnects.
+   * @default eager
+   **/
+  mode?: 'lazy' | 'eager';
 }
 export function createWSClient(opts: WebSocketClientOptions) {
   const {
     url,
     WebSocket: WebSocketImpl = WebSocket,
     retryDelayMs: retryDelayFn = retryDelay,
+    mode = 'eager',
   } = opts;
   /* istanbul ignore next */
   if (!WebSocketImpl) {
@@ -60,38 +68,56 @@ export function createWSClient(opts: WebSocketClientOptions) {
   let connectAttempt = 0;
   let dispatchTimer: NodeJS.Timer | number | null = null;
   let connectTimer: NodeJS.Timer | number | null = null;
-  let activeConnection = createWS();
-  let state: 'open' | 'connecting' | 'closed' = 'connecting';
+  let activeConnection: WebSocket | null = mode === 'eager' ? createWS() : null;
+  // only for internal use to close the connection in tests
+  let state: 'open' | 'closed' = 'open';
+
+  function getOrCreateConnection() {
+    if (
+      !activeConnection ||
+      activeConnection.readyState === WebSocket.CLOSING ||
+      activeConnection.readyState === WebSocket.CLOSED
+    ) {
+      activeConnection = createWS();
+    }
+    return activeConnection;
+  }
   /**
    * tries to send the list of messages
    */
   function dispatch() {
-    if (state !== 'open' || dispatchTimer) {
+    if (dispatchTimer) {
       return;
     }
     dispatchTimer = setTimeout(() => {
       dispatchTimer = null;
+      const conn = getOrCreateConnection();
+      if (conn.readyState !== WebSocket.OPEN) {
+        return;
+      }
 
       if (outgoing.length === 1) {
         // single send
-        activeConnection.send(JSON.stringify(outgoing.pop()));
+        conn.send(JSON.stringify(outgoing.pop()));
       } else {
         // batch send
-        activeConnection.send(JSON.stringify(outgoing));
+        conn.send(JSON.stringify(outgoing));
       }
       // clear
       outgoing = [];
     });
   }
-  function tryReconnect() {
-    if (connectTimer || state === 'closed') {
+  function tryReconnectIfNeeded(conn: WebSocket) {
+    if (connectTimer || conn !== activeConnection || state === 'closed') {
+      return;
+    }
+    if (mode === 'lazy' && outgoing.length === 0) {
       return;
     }
     const timeout = retryDelayFn(connectAttempt++);
     reconnectInMs(timeout);
   }
   function reconnect() {
-    state = 'connecting';
     const oldConnection = activeConnection;
     activeConnection = createWS();
     closeIfNoPending(oldConnection);
@@ -100,11 +126,13 @@ export function createWSClient(opts: WebSocketClientOptions) {
     if (connectTimer) {
       return;
     }
-    state = 'connecting';
     connectTimer = setTimeout(reconnect, ms);
   }
 
-  function closeIfNoPending(conn: WebSocket) {
+  function closeIfNoPending(conn: WebSocket | null) {
+    if (!conn) {
+      return;
+    }
     // disconnect as soon as there are are no pending result
     const hasPendingRequests = Object.values(pendingRequests).some(
       (p) => p.ws === conn,
@@ -132,13 +160,10 @@ export function createWSClient(opts: WebSocketClientOptions) {
         return;
       }
       connectAttempt = 0;
-      state = 'open';
       dispatch();
     });
     conn.addEventListener('error', () => {
-      if (conn === activeConnection) {
-        tryReconnect();
-      }
+      tryReconnectIfNeeded(conn);
     });
     const handleIncomingRequest = (req: TRPCClientIncomingRequest) => {
       if (req.method === 'reconnect' && conn === activeConnection) {
@@ -185,15 +210,12 @@ export function createWSClient(opts: WebSocketClientOptions) {
       if (conn !== activeConnection || state === 'closed') {
         // when receiving a message, we close old connection that has no pending requests
         closeIfNoPending(conn);
+      } else if (mode === 'lazy') {
+        closeIfNoPending(conn);
       }
     });
 
     conn.addEventListener('close', () => {
-      if (activeConnection === conn) {
-        // connection might have been replaced already
-        tryReconnect();
-      }
-
       for (const key in pendingRequests) {
         const req = pendingRequests[key];
         if (req.ws !== conn) {
@@ -207,11 +229,12 @@ export function createWSClient(opts: WebSocketClientOptions) {
         if (req.type !== 'subscription') {
           delete pendingRequests[key];
           req.callbacks.onDone?.();
-        } else if (state !== 'closed') {
+        } else {
           // request restart of sub with next connection
           resumeSubscriptionOnReconnect(req);
         }
       }
+      tryReconnectIfNeeded(conn);
     });
     return conn;
   }
@@ -228,7 +251,7 @@ export function createWSClient(opts: WebSocketClientOptions) {
       },
     };
     pendingRequests[id] = {
-      ws: activeConnection,
+      ws: getOrCreateConnection(),
       type,
       callbacks,
       op,
